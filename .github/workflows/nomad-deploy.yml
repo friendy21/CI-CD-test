@@ -20,6 +20,7 @@ env:
   REGISTRY: docker.io
   IMAGE_NAME: friendy21/cicd-nomad-app
   NOMAD_VERSION: 1.7.5
+  NOMAD_ADDR: http://137.184.85:4646 
 
 jobs:
   build-and-push:
