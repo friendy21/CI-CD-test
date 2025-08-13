@@ -1,0 +1,49 @@
+# /etc/nginx/sites-available/nomad
+upstream nomad-ui {
+    server 127.0.0.1:4646;
+}
+
+upstream consul-ui {
+    server 127.0.0.1:8500;
+}
+
+upstream app {
+    # Dynamically populated by Consul-Template
+    {{ range service "cicd-app" }}
+    server {{ .Address }}:{{ .Port }};
+    {{ end }}
+}
+
+server {
+    listen 80;
+    server_name your-domain.com;
+    
+    # Main app
+    location / {
+        proxy_pass http://app;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    
+    # Nomad UI (protected)
+    location /nomad/ {
+        auth_basic "Nomad UI";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+        
+        proxy_pass http://nomad-ui/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+    
+    # Consul UI (protected)
+    location /consul/ {
+        auth_basic "Consul UI";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+        
+        proxy_pass http://consul-ui/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
