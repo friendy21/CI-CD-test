@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: CI/CD Pipeline (Alternative - No SSH)
 
 on:
   push:
@@ -11,8 +11,8 @@ env:
   IMAGE_NAME: friendy21/cicd-nomad-app
 
 jobs:
-  # Build and Test Job
-  build-and-test:
+  # Build and Push Job
+  build-and-push:
     runs-on: ubuntu-latest
     
     steps:
@@ -36,8 +36,6 @@ jobs:
         tags: |
           type=ref,event=branch
           type=ref,event=pr
-          type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
           type=raw,value=latest,enable={{is_default_branch}}
           type=sha,prefix={{branch}}-
     
@@ -45,7 +43,7 @@ jobs:
       uses: docker/build-push-action@v5
       with:
         context: .
-        platforms: linux/amd64,linux/arm64
+        platforms: linux/amd64
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
@@ -53,65 +51,41 @@ jobs:
         cache-to: type=gha,mode=max
         
     - name: Image digest
-      run: echo ${{ steps.docker_build.outputs.digest }}
+      run: |
+        echo "Image pushed successfully!"
+        echo "Image tags: ${{ steps.meta.outputs.tags }}"
+        echo ""
+        echo "📝 MANUAL DEPLOYMENT REQUIRED:"
+        echo "================================"
+        echo "SSH into your server and run:"
+        echo ""
+        echo "ssh root@137.184.198.14"
+        echo ""
+        echo "Then execute:"
+        echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        echo "docker stop app-container 2>/dev/null || true"
+        echo "docker rm app-container 2>/dev/null || true"
+        echo "docker run -d --name app-container --restart unless-stopped -p 80:3000 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        echo ""
+        echo "Or run the deployment script:"
+        echo "/root/deploy.sh"
+        echo "================================"
 
-  # Deploy Job (runs after successful build)
-  deploy:
-    needs: build-and-test
+  # Notify deployment instructions
+  notify:
+    needs: build-and-push
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     
     steps:
-    - name: Deploy to DigitalOcean Droplet
-      uses: appleboy/ssh-action@v1.0.0
-      with:
-        host: ${{ secrets.DROPLET_HOST }}
-        username: root
-        key: ${{ secrets.DROPLET_SSH_KEY }}
-        port: 22
-        script: |
-          echo "🚀 Starting deployment..."
-          
-          # Login to Docker Hub
-          echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
-          
-          # Pull the latest image
-          echo "📦 Pulling latest Docker image..."
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          
-          # Stop existing container if running
-          echo "🛑 Stopping existing container..."
-          docker stop app-container 2>/dev/null || true
-          docker rm app-container 2>/dev/null || true
-          
-          # Run new container
-          echo "🏃 Starting new container..."
-          docker run -d \
-            --name app-container \
-            --restart unless-stopped \
-            -p 80:3000 \
-            -e NODE_ENV=production \
-            -e PORT=3000 \
-            --memory="512m" \
-            --cpus="0.5" \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          
-          # Wait for container to be healthy
-          echo "⏳ Waiting for container to be healthy..."
-          sleep 5
-          
-          # Check if container is running
-          if docker ps | grep -q app-container; then
-            echo "✅ Deployment successful!"
-            docker ps | grep app-container
-          else
-            echo "❌ Deployment failed!"
-            docker logs app-container
-            exit 1
-          fi
-          
-          # Clean up old images
-          echo "🧹 Cleaning up old images..."
-          docker image prune -af --filter "until=24h"
-          
-          echo "🎉 Deployment complete!"
+    - name: Deployment Instructions
+      run: |
+        echo "🚀 Docker image has been pushed to Docker Hub!"
+        echo ""
+        echo "The image is available at:"
+        echo "docker.io/${{ env.IMAGE_NAME }}:latest"
+        echo ""
+        echo "To deploy manually, SSH into your server:"
+        echo "ssh root@137.184.198.14"
+        echo ""
+        echo "Then pull and run the latest image."
