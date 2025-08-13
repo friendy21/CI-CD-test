@@ -1,0 +1,37 @@
+# .github/workflows/nomad-deploy.yml
+name: Nomad Deployment Pipeline
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Build and Push Docker Image
+      # ... (your existing Docker build steps)
+    
+    - name: Deploy to Nomad
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      run: |
+        # Install Nomad CLI
+        curl -Os https://releases.hashicorp.com/nomad/1.7.5/nomad_1.7.5_linux_amd64.zip
+        unzip nomad_1.7.5_linux_amd64.zip
+        
+        # Update job with new image tag
+        sed -i 's|image = ".*"|image = "docker.io/friendy21/cicd-nomad-app:${{ github.sha }}"|' cicd-app.nomad
+        
+        # Plan the deployment
+        ./nomad job plan cicd-app.nomad
+        
+        # Run the deployment
+        ./nomad job run -check-index $(./nomad job status -json cicd-app | jq .JobModifyIndex) cicd-app.nomad
+        
+        # Monitor deployment
+        ./nomad job status cicd-app
