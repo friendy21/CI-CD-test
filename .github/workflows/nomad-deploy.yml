@@ -90,7 +90,6 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: ${{ github.event.inputs.environment || 'production' }}
-      url: https://${{ secrets.NOMAD_ADDR }}
     
     steps:
     - name: Checkout code
