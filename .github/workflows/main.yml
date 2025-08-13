@@ -138,6 +138,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment:
       name: production
+      url: https://${{ secrets.DROPLET_HOST }}
     
     steps:
     - name: Checkout code
