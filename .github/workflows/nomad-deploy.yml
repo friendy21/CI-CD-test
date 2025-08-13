@@ -79,7 +79,7 @@ jobs:
         EOF
     
     - name: Upload deployment manifest
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: deployment-manifest
         path: deployment-manifest.json
@@ -96,7 +96,7 @@ jobs:
       uses: actions/checkout@v4
     
     - name: Download deployment manifest
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         name: deployment-manifest
     
@@ -275,3 +275,5 @@ jobs:
         else
           echo "No previous version to rollback to"
         fi
+
+}
