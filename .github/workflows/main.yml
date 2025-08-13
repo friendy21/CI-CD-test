@@ -1,27 +1,99 @@
-name: CI/CD Pipeline (Alternative - No SSH)
+name: Production CI/CD Pipeline
 
 on:
   push:
     branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
 
 env:
   REGISTRY: docker.io
   IMAGE_NAME: friendy21/cicd-nomad-app
+  NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+  CONSUL_ADDR: ${{ secrets.CONSUL_ADDR }}
 
 jobs:
-  # Build and Push Job
-  build-and-push:
+  # Security scanning job
+  security-scan:
     runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+        
+    - name: Upload Trivy results to GitHub Security
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+    - name: Check for secrets
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: main
+        head: HEAD
+
+  # Build and test job
+  build-test:
+    runs-on: ubuntu-latest
+    needs: security-scan
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-digest: ${{ steps.build.outputs.digest }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: |
+        npm ci --only=production
+        npm audit fix --audit-level=high
+        
+    - name: Run tests
+      run: |
+        npm test
+        npm run test:security || true
+        
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-      
+      with:
+        driver-opts: |
+          network=host
+          image=moby/buildkit:latest
+        buildkitd-flags: --debug
+        
     - name: Log in to Docker Hub
       uses: docker/login-action@v3
       with:
@@ -36,56 +108,163 @@ jobs:
         tags: |
           type=ref,event=branch
           type=ref,event=pr
-          type=raw,value=latest,enable={{is_default_branch}}
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
           type=sha,prefix={{branch}}-
+          type=raw,value={{date 'YYYYMMDD-HHmmss'}}
+          type=raw,value=latest,enable={{is_default_branch}}
     
     - name: Build and push Docker image
+      id: build
       uses: docker/build-push-action@v5
       with:
         context: .
-        platforms: linux/amd64
+        platforms: linux/amd64,linux/arm64
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-        
-    - name: Image digest
-      run: |
-        echo "Image pushed successfully!"
-        echo "Image tags: ${{ steps.meta.outputs.tags }}"
-        echo ""
-        echo "📝 MANUAL DEPLOYMENT REQUIRED:"
-        echo "================================"
-        echo "SSH into your server and run:"
-        echo ""
-        echo "ssh root@137.184.198.14"
-        echo ""
-        echo "Then execute:"
-        echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-        echo "docker stop app-container 2>/dev/null || true"
-        echo "docker rm app-container 2>/dev/null || true"
-        echo "docker run -d --name app-container --restart unless-stopped -p 80:3000 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-        echo ""
-        echo "Or run the deployment script:"
-        echo "/root/deploy.sh"
-        echo "================================"
+        cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VCS_REF=${{ github.sha }}
+          VERSION=${{ steps.meta.outputs.version }}
+        secrets: |
+          "npm_token=${{ secrets.NPM_TOKEN }}"
+          
+    - name: Scan Docker image
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        format: 'table'
+        exit-code: '1'
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'
 
-  # Notify deployment instructions
-  notify:
-    needs: build-and-push
+  # Deploy to staging
+  deploy-staging:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    needs: build-test
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    environment:
+      name: staging
+      url: https://staging.app.example.com
     
     steps:
-    - name: Deployment Instructions
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Deploy to staging via Nomad
+      env:
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN_STAGING }}
       run: |
-        echo "🚀 Docker image has been pushed to Docker Hub!"
-        echo ""
-        echo "The image is available at:"
-        echo "docker.io/${{ env.IMAGE_NAME }}:latest"
-        echo ""
-        echo "To deploy manually, SSH into your server:"
-        echo "ssh root@137.184.198.14"
-        echo ""
-        echo "Then pull and run the latest image."
+        # Install Nomad CLI
+        curl -L https://releases.hashicorp.com/nomad/1.7.5/nomad_1.7.5_linux_amd64.zip -o nomad.zip
+        unzip nomad.zip
+        chmod +x nomad
+        
+        # Deploy using Nomad job spec
+        ./nomad job run \
+          -var="image_tag=${{ needs.build-test.outputs.image-tag }}" \
+          -var="environment=staging" \
+          nomad/staging.nomad.hcl
+          
+    - name: Health check
+      run: |
+        for i in {1..30}; do
+          if curl -f https://staging.app.example.com/health; then
+            echo "Deployment successful!"
+            exit 0
+          fi
+          echo "Waiting for deployment... (attempt $i/30)"
+          sleep 10
+        done
+        echo "Deployment health check failed!"
+        exit 1
+
+  # Deploy to production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [build-test, deploy-staging]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment:
+      name: production
+      url: https://app.example.com
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Nomad CLI
+      run: |
+        curl -L https://releases.hashicorp.com/nomad/1.7.5/nomad_1.7.5_linux_amd64.zip -o nomad.zip
+        unzip nomad.zip
+        chmod +x nomad
+        sudo mv nomad /usr/local/bin/
+        
+    - name: Deploy via Nomad (Blue-Green)
+      env:
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN_PRODUCTION }}
+      run: |
+        # Deploy new version as canary
+        nomad job run \
+          -var="image_tag=${{ needs.build-test.outputs.image-tag }}" \
+          -var="environment=production" \
+          -var="deployment_type=canary" \
+          -var="canary_weight=10" \
+          nomad/production.nomad.hcl
+          
+        # Wait for canary to be healthy
+        sleep 60
+        
+        # Promote if healthy
+        DEPLOYMENT_ID=$(nomad job deployments cicd-app -json | jq -r '.[0].ID')
+        nomad deployment promote $DEPLOYMENT_ID
+        
+    - name: Verify deployment
+      run: |
+        # Check deployment status
+        nomad job status cicd-app
+        
+        # Verify application health
+        ./scripts/verify-deployment.sh production
+        
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Deployment failed, initiating rollback..."
+        nomad job revert cicd-app 1
+        
+  # Notifications
+  notify:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: Send Slack notification
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: |
+          Deployment Status: ${{ job.status }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+          Message: ${{ github.event.head_commit.message }}
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        
+    - name: Create deployment record
+      run: |
+        curl -X POST ${{ secrets.DEPLOYMENT_TRACKER_URL }} \
+          -H "Authorization: Bearer ${{ secrets.DEPLOYMENT_TRACKER_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "service": "cicd-app",
+            "version": "${{ needs.build-test.outputs.image-tag }}",
+            "environment": "${{ github.event.inputs.deploy_environment || 'production' }}",
+            "status": "${{ job.status }}",
+            "deployed_by": "${{ github.actor }}",
+            "commit_sha": "${{ github.sha }}",
+            "timestamp": "${{ github.event.head_commit.timestamp }}"
+          }'
