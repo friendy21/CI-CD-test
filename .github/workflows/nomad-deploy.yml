@@ -79,7 +79,7 @@ jobs:
         EOF
     
     - name: Upload deployment manifest
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v3
       with:
         name: deployment-manifest
         path: deployment-manifest.json
@@ -90,13 +90,14 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: ${{ github.event.inputs.environment || 'production' }}
+      url: https://${{ secrets.NOMAD_ADDR }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
     - name: Download deployment manifest
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v3
       with:
         name: deployment-manifest
     
@@ -275,5 +276,3 @@ jobs:
         else
           echo "No previous version to rollback to"
         fi
-
-}
