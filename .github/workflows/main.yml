@@ -17,16 +17,19 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       
-    - name: Run Trivy vulnerability scanner
+    - name: Run Trivy vulnerability scanner on filesystem
       uses: aquasecurity/trivy-action@master
       with:
         scan-type: 'fs'
         scan-ref: '.'
         format: 'sarif'
         output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH,MEDIUM'
+        exit-code: '1'
     
     - name: Upload Trivy results to GitHub Security
       uses: github/codeql-action/upload-sarif@v2
+      if: always()
       with:
         sarif_file: 'trivy-results.sarif'
 
@@ -37,19 +40,31 @@ jobs:
       contents: read
       packages: write
       security-events: write
+      id-token: write  # For OIDC authentication
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: |
+          network=host
+          image=moby/buildkit:master
       
     - name: Log in to Docker Hub
       uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_TOKEN }}  # Use GitHub Secrets
+        password: ${{ secrets.DOCKER_TOKEN }}
     
     - name: Extract metadata
       id: meta
@@ -63,19 +78,14 @@ jobs:
           type=semver,pattern={{major}}.{{minor}}
           type=sha,prefix={{branch}}-
           type=raw,value=latest,enable={{is_default_branch}}
-    
-    - name: Scan Docker image
-      uses: aquasecurity/trivy-action@master
-      with:
-        image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}'
-        format: 'sarif'
-        output: 'docker-scan.sarif'
+          type=raw,value={{date 'YYYYMMDD-HHmmss'}}-{{sha}}
     
     - name: Build and push Docker image
+      id: build
       uses: docker/build-push-action@v5
       with:
         context: .
-        platforms: linux/amd64
+        platforms: linux/amd64,linux/arm64
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
@@ -84,13 +94,56 @@ jobs:
         build-args: |
           BUILDKIT_INLINE_CACHE=1
           VERSION=${{ github.sha }}
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+        provenance: true
+        sbom: true
+    
+    - name: Scan pushed Docker image
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        format: 'sarif'
+        output: 'docker-scan.sarif'
+        severity: 'CRITICAL,HIGH'
+        exit-code: '0'  # Don't fail after push, but report
+    
+    - name: Upload Docker scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'docker-scan.sarif'
+        category: 'docker-image-scan'
+    
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        artifact-name: sbom.spdx
+        output-file: ./sbom.spdx.json
+    
+    - name: Sign container image
+      env:
+        COSIGN_EXPERIMENTAL: 1
+      run: |
+        # Install cosign
+        curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /tmp/cosign
+        chmod +x /tmp/cosign
+        
+        # Sign the image with keyless signing
+        /tmp/cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
 
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://${{ secrets.DROPLET_HOST }}
     
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
     - name: Deploy to DigitalOcean
       uses: appleboy/ssh-action@v0.1.5
       with:
@@ -98,31 +151,121 @@ jobs:
         username: ${{ secrets.DROPLET_USER }}
         key: ${{ secrets.DROPLET_SSH_KEY }}
         port: ${{ secrets.SSH_PORT }}
+        script_stop: true
         script: |
-          # Pull and deploy with health checks
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          set -euo pipefail
           
-          # Blue-green deployment
-          docker run -d --name app-new --restart unless-stopped \
-            --network app-network \
+          # Configuration
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}"
+          CONTAINER_NAME="app-container"
+          NEW_CONTAINER="app-new-$(date +%s)"
+          
+          # Pull new image with retry logic
+          for i in {1..3}; do
+            if docker pull "${IMAGE}"; then
+              break
+            fi
+            echo "Retry $i/3 failed, waiting..."
+            sleep 5
+          done
+          
+          # Start new container with health check
+          docker run -d \
+            --name "${NEW_CONTAINER}" \
+            --restart unless-stopped \
+            --memory="512m" \
+            --cpus="0.5" \
             --health-cmd="curl -f http://localhost:3000/health || exit 1" \
-            --health-interval=30s \
-            --health-timeout=10s \
+            --health-interval=10s \
+            --health-timeout=5s \
             --health-retries=3 \
+            --health-start-period=30s \
+            -p 3001:3000 \
             -e NODE_ENV=production \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            -e PORT=3000 \
+            --label "traefik.enable=true" \
+            --label "traefik.http.routers.app.rule=Host(\`app.domain.com\`)" \
+            --label "deployment.timestamp=$(date -Iseconds)" \
+            "${IMAGE}"
           
           # Wait for health check
-          sleep 10
-          
-          if docker exec app-new curl -f http://localhost:3000/health; then
-            docker stop app-container || true
-            docker rm app-container || true
-            docker rename app-new app-container
-            docker network connect bridge app-container
-            docker network disconnect app-network app-container || true
-          else
-            docker stop app-new
-            docker rm app-new
-            exit 1
-          fi
+          echo "Waiting for health check..."
+          HEALTH_CHECK_RETRIES=30
+          for i in $(seq 1 $HEALTH_CHECK_RETRIES); do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' ${NEW_CONTAINER})" == "healthy" ]; then
+              echo "Health check passed!"
+              
+              # Perform traffic switch
+              OLD_CONTAINER=$(docker ps -q -f name="^${CONTAINER_NAME}$" || true)
+              
+              if [ -n "${OLD_CONTAINER}" ]; then
+                # Graceful shutdown of old container
+                docker stop --time=30 "${CONTAINER_NAME}" || true
+                docker rm "${CONTAINER_NAME}" || true
+              fi
+              
+              # Rename new container
+              docker rename "${NEW_CONTAINER}" "${CONTAINER_NAME}"
+              
+              # Update port mapping
+              docker stop "${CONTAINER_NAME}"
+              docker run -d \
+                --name "${CONTAINER_NAME}-final" \
+                --restart unless-stopped \
+                --memory="512m" \
+                --cpus="0.5" \
+                --health-cmd="curl -f http://localhost:3000/health || exit 1" \
+                --health-interval=30s \
+                --health-timeout=10s \
+                --health-retries=3 \
+                -p 80:3000 \
+                -p 443:3000 \
+                -e NODE_ENV=production \
+                -e PORT=3000 \
+                "${IMAGE}"
+              
+              docker rm "${CONTAINER_NAME}"
+              docker rename "${CONTAINER_NAME}-final" "${CONTAINER_NAME}"
+              
+              echo "Deployment successful!"
+              docker ps --filter name="${CONTAINER_NAME}"
+              
+              # Cleanup old images
+              docker image prune -af --filter "until=24h"
+              exit 0
+            fi
+            
+            if [ $i -eq $HEALTH_CHECK_RETRIES ]; then
+              echo "Health check failed after ${HEALTH_CHECK_RETRIES} attempts"
+              docker logs "${NEW_CONTAINER}"
+              docker stop "${NEW_CONTAINER}"
+              docker rm "${NEW_CONTAINER}"
+              exit 1
+            fi
+            
+            sleep 2
+          done
+    
+    - name: Verify deployment
+      uses: appleboy/ssh-action@v0.1.5
+      with:
+        host: ${{ secrets.DROPLET_HOST }}
+        username: ${{ secrets.DROPLET_USER }}
+        key: ${{ secrets.DROPLET_SSH_KEY }}
+        port: ${{ secrets.SSH_PORT }}
+        script: |
+          # Verify the deployment
+          curl -f http://localhost/health || exit 1
+          echo "Application is healthy and running!"
+    
+    - name: Notify deployment status
+      if: always()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: |
+          Deployment ${{ job.status }} for commit ${{ github.sha }}
+          Author: ${{ github.actor }}
+          Message: ${{ github.event.head_commit.message }}
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+      continue-on-error: true
