@@ -4,34 +4,275 @@ name: Nomad Deployment Pipeline
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: friendy21/cicd-nomad-app
+  NOMAD_VERSION: 1.7.5
 
 jobs:
-  build-and-deploy:
+  build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-digest: ${{ steps.build.outputs.digest }}
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=sha,prefix={{branch}}-
+          type=raw,value={{date 'YYYYMMDD-HHmmss'}}-{{sha}}
+          type=raw,value=latest,enable={{is_default_branch}}
     
     - name: Build and Push Docker Image
-      # ... (your existing Docker build steps)
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+        build-args: |
+          VERSION=${{ github.sha }}
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+    
+    - name: Generate deployment manifest
+      run: |
+        cat > deployment-manifest.json <<EOF
+        {
+          "image": "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}",
+          "tag": "${{ steps.meta.outputs.version }}",
+          "commit": "${{ github.sha }}",
+          "timestamp": "$(date -Iseconds)",
+          "author": "${{ github.actor }}"
+        }
+        EOF
+    
+    - name: Upload deployment manifest
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-manifest
+        path: deployment-manifest.json
+        retention-days: 30
+
+  deploy-to-nomad:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url: https://${{ secrets.NOMAD_ADDR }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download deployment manifest
+      uses: actions/download-artifact@v3
+      with:
+        name: deployment-manifest
+    
+    - name: Setup Nomad CLI
+      run: |
+        # Download and install Nomad CLI
+        curl -sL "https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_amd64.zip" -o nomad.zip
+        unzip -q nomad.zip
+        sudo mv nomad /usr/local/bin/
+        nomad version
+    
+    - name: Validate Nomad job specification
+      run: |
+        # Update job with new image
+        IMAGE_DIGEST="${{ needs.build-and-push.outputs.image-digest }}"
+        sed -i "s|image = \".*\"|image = \"${REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}\"|" cicd-app.nomad
+        
+        # Validate the job file
+        nomad job validate cicd-app.nomad
+    
+    - name: Plan Nomad deployment
+      id: plan
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+        NOMAD_NAMESPACE: default
+        NOMAD_REGION: global
+      run: |
+        # Create plan output
+        nomad job plan \
+          -address="${NOMAD_ADDR}" \
+          -token="${NOMAD_TOKEN}" \
+          -namespace="${NOMAD_NAMESPACE}" \
+          -region="${NOMAD_REGION}" \
+          -diff \
+          -policy-override \
+          -json \
+          cicd-app.nomad > plan.json
+        
+        # Extract check index
+        CHECK_INDEX=$(jq -r '.JobModifyIndex // 0' plan.json)
+        echo "check_index=${CHECK_INDEX}" >> $GITHUB_OUTPUT
+        
+        # Display plan diff for review
+        jq -r '.Diff' plan.json || true
     
     - name: Deploy to Nomad
+      id: deploy
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+        NOMAD_NAMESPACE: default
+        NOMAD_REGION: global
+      run: |
+        # Run the deployment with check-index for safety
+        nomad job run \
+          -address="${NOMAD_ADDR}" \
+          -token="${NOMAD_TOKEN}" \
+          -namespace="${NOMAD_NAMESPACE}" \
+          -region="${NOMAD_REGION}" \
+          -check-index="${{ steps.plan.outputs.check_index }}" \
+          -json \
+          cicd-app.nomad > deploy.json
+        
+        # Extract evaluation ID
+        EVAL_ID=$(jq -r '.EvalID' deploy.json)
+        echo "eval_id=${EVAL_ID}" >> $GITHUB_OUTPUT
+        
+        # Display deployment info
+        echo "Deployment started with Evaluation ID: ${EVAL_ID}"
+        jq . deploy.json
+    
+    - name: Monitor deployment
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
-        # Install Nomad CLI
-        curl -Os https://releases.hashicorp.com/nomad/1.7.5/nomad_1.7.5_linux_amd64.zip
-        unzip nomad_1.7.5_linux_amd64.zip
+        EVAL_ID="${{ steps.deploy.outputs.eval_id }}"
+        MAX_WAIT=300  # 5 minutes timeout
+        INTERVAL=10   # Check every 10 seconds
+        ELAPSED=0
         
-        # Update job with new image tag
-        sed -i 's|image = ".*"|image = "docker.io/friendy21/cicd-nomad-app:${{ github.sha }}"|' cicd-app.nomad
+        echo "Monitoring evaluation ${EVAL_ID}..."
         
-        # Plan the deployment
-        ./nomad job plan cicd-app.nomad
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          # Get evaluation status
+          STATUS=$(nomad eval status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -json "${EVAL_ID}" | jq -r '.Status')
+          
+          echo "Evaluation status: ${STATUS}"
+          
+          if [ "${STATUS}" = "complete" ]; then
+            echo "Deployment completed successfully!"
+            
+            # Get deployment status
+            nomad job status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" cicd-app
+            
+            # Get allocation status
+            nomad job status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -verbose cicd-app | grep -A 10 "Allocations"
+            
+            exit 0
+          elif [ "${STATUS}" = "failed" ] || [ "${STATUS}" = "canceled" ]; then
+            echo "Deployment failed with status: ${STATUS}"
+            
+            # Get failure details
+            nomad eval status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -verbose "${EVAL_ID}"
+            
+            exit 1
+          fi
+          
+          sleep $INTERVAL
+          ELAPSED=$((ELAPSED + INTERVAL))
+        done
         
-        # Run the deployment
-        ./nomad job run -check-index $(./nomad job status -json cicd-app | jq .JobModifyIndex) cicd-app.nomad
+        echo "Deployment timeout after ${MAX_WAIT} seconds"
+        exit 1
+    
+    - name: Verify deployment health
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      run: |
+        # Wait for allocations to be healthy
+        sleep 30
         
-        # Monitor deployment
-        ./nomad job status cicd-app
+        # Check allocation health
+        HEALTHY=$(nomad job status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -json cicd-app | \
+                  jq '[.Allocations[] | select(.ClientStatus == "running" and .DesiredStatus == "run")] | length')
+        
+        DESIRED=$(nomad job status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -json cicd-app | \
+                  jq '.TaskGroups[0].Count // 1')
+        
+        if [ "${HEALTHY}" -ge "${DESIRED}" ]; then
+          echo "Deployment verified: ${HEALTHY}/${DESIRED} allocations healthy"
+        else
+          echo "Deployment unhealthy: only ${HEALTHY}/${DESIRED} allocations running"
+          exit 1
+        fi
+    
+    - name: Create deployment annotation
+      if: success()
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          await github.rest.repos.createDeployment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: context.sha,
+            task: 'deploy',
+            auto_merge: false,
+            required_contexts: [],
+            payload: {
+              environment: '${{ github.event.inputs.environment || 'production' }}',
+              image_digest: '${{ needs.build-and-push.outputs.image-digest }}'
+            },
+            environment: '${{ github.event.inputs.environment || 'production' }}',
+            description: 'Nomad deployment via GitHub Actions'
+          });
+    
+    - name: Rollback on failure
+      if: failure() && steps.deploy.outputs.eval_id
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      run: |
+        echo "Rolling back deployment..."
+        
+        # Get the previous job version
+        PREV_VERSION=$(nomad job history -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -json cicd-app | \
+                       jq -r '.[1].Version // 0')
+        
+        if [ "${PREV_VERSION}" -gt 0 ]; then
+          # Revert to previous version
+          nomad job revert -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" cicd-app "${PREV_VERSION}" -yes
+          echo "Rolled back to version ${PREV_VERSION}"
+        else
+          echo "No previous version to rollback to"
+        fi
