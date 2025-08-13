@@ -1,0 +1,22 @@
+# /etc/systemd/system/nomad.service
+[Unit]
+Description=Nomad
+Documentation=https://nomadproject.io/docs/
+Wants=network-online.target consul.service
+After=network-online.target consul.service
+
+[Service]
+Type=notify
+User=nomad
+Group=nomad
+ExecStart=/usr/local/bin/nomad agent -config /etc/nomad.d/
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=2
+StartLimitBurst=3
+TasksMax=infinity
+OOMScoreAdjust=-1000
+
+[Install]
+WantedBy=multi-user.target
