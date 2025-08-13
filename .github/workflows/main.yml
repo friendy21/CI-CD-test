@@ -28,7 +28,7 @@ jobs:
         exit-code: '1'
     
     - name: Upload Trivy results to GitHub Security
-      uses: github/codeql-action/upload-sarif@v2
+      uses: github/codeql-action/upload-sarif@v3
       if: always()
       with:
         sarif_file: 'trivy-results.sarif'
@@ -108,7 +108,7 @@ jobs:
         exit-code: '0'  # Don't fail after push, but report
     
     - name: Upload Docker scan results
-      uses: github/codeql-action/upload-sarif@v2
+      uses: github/codeql-action/upload-sarif@v3
       if: always()
       with:
         sarif_file: 'docker-scan.sarif'
