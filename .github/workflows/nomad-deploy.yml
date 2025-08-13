@@ -88,9 +88,14 @@ jobs:
   deploy-to-nomad:
     needs: build-and-push
     runs-on: ubuntu-latest
+    # Only run if all required secrets are available
+    if: |
+      vars.NOMAD_ADDR != '' && 
+      secrets.NOMAD_TOKEN != '' &&
+      secrets.NOMAD_CA_CERT != ''
     environment:
       name: ${{ github.event.inputs.environment || 'production' }}
-      url: https://${{ secrets.NOMAD_ADDR }}
+      url: ${{ vars.NOMAD_ADDR }}
     
     steps:
     - name: Checkout code
@@ -108,6 +113,12 @@ jobs:
         unzip -q nomad.zip
         sudo mv nomad /usr/local/bin/
         nomad version
+        
+        # Setup Nomad CA certificate if provided
+        if [ -n "${{ secrets.NOMAD_CA_CERT }}" ]; then
+          echo "${{ secrets.NOMAD_CA_CERT }}" > nomad-ca.crt
+          export NOMAD_CACERT="$(pwd)/nomad-ca.crt"
+        fi
     
     - name: Validate Nomad job specification
       run: |
@@ -115,23 +126,31 @@ jobs:
         IMAGE_DIGEST="${{ needs.build-and-push.outputs.image-digest }}"
         sed -i "s|image = \".*\"|image = \"${REGISTRY}/${IMAGE_NAME}@${IMAGE_DIGEST}\"|" cicd-app.nomad
         
+        # Update Docker credentials in job file
+        sed -i "s/\${DOCKER_USERNAME}/${{ secrets.DOCKER_USERNAME }}/g" cicd-app.nomad
+        sed -i "s/\${DOCKER_TOKEN}/${{ secrets.DOCKER_TOKEN }}/g" cicd-app.nomad
+        
         # Validate the job file
+        NOMAD_ADDR="${{ vars.NOMAD_ADDR }}" \
+        NOMAD_TOKEN="${{ secrets.NOMAD_TOKEN }}" \
         nomad job validate cicd-app.nomad
     
     - name: Plan Nomad deployment
       id: plan
       env:
-        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_ADDR: ${{ vars.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
-        NOMAD_NAMESPACE: default
-        NOMAD_REGION: global
+        NOMAD_NAMESPACE: ${{ vars.NOMAD_NAMESPACE || 'default' }}
+        NOMAD_REGION: ${{ vars.NOMAD_REGION || 'global' }}
       run: |
+        # Setup CA cert if provided
+        if [ -n "${{ secrets.NOMAD_CA_CERT }}" ]; then
+          echo "${{ secrets.NOMAD_CA_CERT }}" > nomad-ca.crt
+          export NOMAD_CACERT="$(pwd)/nomad-ca.crt"
+        fi
+        
         # Create plan output
         nomad job plan \
-          -address="${NOMAD_ADDR}" \
-          -token="${NOMAD_TOKEN}" \
-          -namespace="${NOMAD_NAMESPACE}" \
-          -region="${NOMAD_REGION}" \
           -diff \
           -policy-override \
           -json \
@@ -142,22 +161,27 @@ jobs:
         echo "check_index=${CHECK_INDEX}" >> $GITHUB_OUTPUT
         
         # Display plan diff for review
-        jq -r '.Diff' plan.json || true
+        echo "### Nomad Deployment Plan" >> $GITHUB_STEP_SUMMARY
+        echo '```json' >> $GITHUB_STEP_SUMMARY
+        jq -r '.Diff' plan.json >> $GITHUB_STEP_SUMMARY || echo "No diff available" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
     
     - name: Deploy to Nomad
       id: deploy
       env:
-        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_ADDR: ${{ vars.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
-        NOMAD_NAMESPACE: default
-        NOMAD_REGION: global
+        NOMAD_NAMESPACE: ${{ vars.NOMAD_NAMESPACE || 'default' }}
+        NOMAD_REGION: ${{ vars.NOMAD_REGION || 'global' }}
       run: |
+        # Setup CA cert if provided
+        if [ -n "${{ secrets.NOMAD_CA_CERT }}" ]; then
+          echo "${{ secrets.NOMAD_CA_CERT }}" > nomad-ca.crt
+          export NOMAD_CACERT="$(pwd)/nomad-ca.crt"
+        fi
+        
         # Run the deployment with check-index for safety
         nomad job run \
-          -address="${NOMAD_ADDR}" \
-          -token="${NOMAD_TOKEN}" \
-          -namespace="${NOMAD_NAMESPACE}" \
-          -region="${NOMAD_REGION}" \
           -check-index="${{ steps.plan.outputs.check_index }}" \
           -json \
           cicd-app.nomad > deploy.json
@@ -168,13 +192,20 @@ jobs:
         
         # Display deployment info
         echo "Deployment started with Evaluation ID: ${EVAL_ID}"
-        jq . deploy.json
+        echo "### Deployment Started" >> $GITHUB_STEP_SUMMARY
+        echo "Evaluation ID: \`${EVAL_ID}\`" >> $GITHUB_STEP_SUMMARY
     
     - name: Monitor deployment
       env:
-        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_ADDR: ${{ vars.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
+        # Setup CA cert if provided
+        if [ -n "${{ secrets.NOMAD_CA_CERT }}" ]; then
+          echo "${{ secrets.NOMAD_CA_CERT }}" > nomad-ca.crt
+          export NOMAD_CACERT="$(pwd)/nomad-ca.crt"
+        fi
+        
         EVAL_ID="${{ steps.deploy.outputs.eval_id }}"
         MAX_WAIT=300  # 5 minutes timeout
         INTERVAL=10   # Check every 10 seconds
@@ -184,7 +215,7 @@ jobs:
         
         while [ $ELAPSED -lt $MAX_WAIT ]; do
           # Get evaluation status
-          STATUS=$(nomad eval status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -json "${EVAL_ID}" | jq -r '.Status')
+          STATUS=$(nomad eval status -json "${EVAL_ID}" | jq -r '.Status')
           
           echo "Evaluation status: ${STATUS}"
           
@@ -192,18 +223,21 @@ jobs:
             echo "Deployment completed successfully!"
             
             # Get deployment status
-            nomad job status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" cicd-app
+            nomad job status cicd-app
             
             # Get allocation status
-            nomad job status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -verbose cicd-app | grep -A 10 "Allocations"
+            nomad job status -verbose cicd-app | grep -A 10 "Allocations" || true
             
+            echo "### Deployment Successful ✅" >> $GITHUB_STEP_SUMMARY
             exit 0
           elif [ "${STATUS}" = "failed" ] || [ "${STATUS}" = "canceled" ]; then
             echo "Deployment failed with status: ${STATUS}"
             
             # Get failure details
-            nomad eval status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -verbose "${EVAL_ID}"
+            nomad eval status -verbose "${EVAL_ID}"
             
+            echo "### Deployment Failed ❌" >> $GITHUB_STEP_SUMMARY
+            echo "Status: ${STATUS}" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
           
@@ -212,27 +246,41 @@ jobs:
         done
         
         echo "Deployment timeout after ${MAX_WAIT} seconds"
+        echo "### Deployment Timeout ⏰" >> $GITHUB_STEP_SUMMARY
         exit 1
     
     - name: Verify deployment health
       env:
-        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_ADDR: ${{ vars.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
+        # Setup CA cert if provided
+        if [ -n "${{ secrets.NOMAD_CA_CERT }}" ]; then
+          echo "${{ secrets.NOMAD_CA_CERT }}" > nomad-ca.crt
+          export NOMAD_CACERT="$(pwd)/nomad-ca.crt"
+        fi
+        
         # Wait for allocations to be healthy
         sleep 30
         
         # Check allocation health
-        HEALTHY=$(nomad job status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -json cicd-app | \
-                  jq '[.Allocations[] | select(.ClientStatus == "running" and .DesiredStatus == "run")] | length')
+        JOB_STATUS=$(nomad job status -json cicd-app)
+        HEALTHY=$(echo "$JOB_STATUS" | jq '[.Allocations[] | select(.ClientStatus == "running" and .DesiredStatus == "run")] | length')
+        DESIRED=$(echo "$JOB_STATUS" | jq '.TaskGroups[0].Count // 1')
         
-        DESIRED=$(nomad job status -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -json cicd-app | \
-                  jq '.TaskGroups[0].Count // 1')
+        echo "Health check: ${HEALTHY}/${DESIRED} allocations healthy"
         
         if [ "${HEALTHY}" -ge "${DESIRED}" ]; then
           echo "Deployment verified: ${HEALTHY}/${DESIRED} allocations healthy"
+          echo "### Health Check Passed ✅" >> $GITHUB_STEP_SUMMARY
+          echo "Healthy allocations: ${HEALTHY}/${DESIRED}" >> $GITHUB_STEP_SUMMARY
         else
           echo "Deployment unhealthy: only ${HEALTHY}/${DESIRED} allocations running"
+          echo "### Health Check Failed ❌" >> $GITHUB_STEP_SUMMARY
+          echo "Healthy allocations: ${HEALTHY}/${DESIRED}" >> $GITHUB_STEP_SUMMARY
+          
+          # Show allocation details for debugging
+          nomad job status -verbose cicd-app
           exit 1
         fi
     
@@ -251,7 +299,8 @@ jobs:
             required_contexts: [],
             payload: {
               environment: '${{ github.event.inputs.environment || 'production' }}',
-              image_digest: '${{ needs.build-and-push.outputs.image-digest }}'
+              image_digest: '${{ needs.build-and-push.outputs.image-digest }}',
+              nomad_job: 'cicd-app'
             },
             environment: '${{ github.event.inputs.environment || 'production' }}',
             description: 'Nomad deployment via GitHub Actions'
@@ -260,19 +309,109 @@ jobs:
     - name: Rollback on failure
       if: failure() && steps.deploy.outputs.eval_id
       env:
-        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_ADDR: ${{ vars.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
         echo "Rolling back deployment..."
         
+        # Setup CA cert if provided
+        if [ -n "${{ secrets.NOMAD_CA_CERT }}" ]; then
+          echo "${{ secrets.NOMAD_CA_CERT }}" > nomad-ca.crt
+          export NOMAD_CACERT="$(pwd)/nomad-ca.crt"
+        fi
+        
         # Get the previous job version
-        PREV_VERSION=$(nomad job history -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" -json cicd-app | \
-                       jq -r '.[1].Version // 0')
+        PREV_VERSION=$(nomad job history -json cicd-app | jq -r '.[1].Version // 0')
         
         if [ "${PREV_VERSION}" -gt 0 ]; then
           # Revert to previous version
-          nomad job revert -address="${NOMAD_ADDR}" -token="${NOMAD_TOKEN}" cicd-app "${PREV_VERSION}" -yes
+          nomad job revert cicd-app "${PREV_VERSION}" -yes
           echo "Rolled back to version ${PREV_VERSION}"
+          echo "### Rollback Completed 🔄" >> $GITHUB_STEP_SUMMARY
+          echo "Reverted to version: ${PREV_VERSION}" >> $GITHUB_STEP_SUMMARY
         else
           echo "No previous version to rollback to"
+          echo "### Rollback Skipped ⚠️" >> $GITHUB_STEP_SUMMARY
+          echo "No previous version available" >> $GITHUB_STEP_SUMMARY
         fi
+
+  # Fallback deployment to simple Docker if Nomad is not available
+  deploy-docker-fallback:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # Only run if Nomad secrets are not available
+    if: |
+      vars.NOMAD_ADDR == '' || 
+      secrets.NOMAD_TOKEN == '' ||
+      secrets.DROPLET_HOST == ''
+    environment:
+      name: production-docker
+      url: https://${{ secrets.DROPLET_HOST }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Deploy to DigitalOcean via Docker
+      uses: appleboy/ssh-action@v0.1.5
+      with:
+        host: ${{ secrets.DROPLET_HOST }}
+        username: ${{ secrets.DROPLET_USER }}
+        key: ${{ secrets.DROPLET_SSH_KEY }}
+        port: ${{ secrets.SSH_PORT }}
+        script_stop: true
+        script: |
+          set -euo pipefail
+          
+          # Configuration
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}"
+          CONTAINER_NAME="cicd-app"
+          
+          # Login to Docker Hub
+          echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          
+          # Pull new image
+          docker pull "${IMAGE}"
+          
+          # Stop and remove old container
+          docker stop "${CONTAINER_NAME}" || true
+          docker rm "${CONTAINER_NAME}" || true
+          
+          # Start new container
+          docker run -d \
+            --name "${CONTAINER_NAME}" \
+            --restart unless-stopped \
+            --memory="512m" \
+            --cpus="0.5" \
+            --health-cmd="curl -f http://localhost:3000/health || exit 1" \
+            --health-interval=30s \
+            --health-timeout=10s \
+            --health-retries=3 \
+            -p 80:3000 \
+            -e NODE_ENV=production \
+            -e PORT=3000 \
+            "${IMAGE}"
+          
+          # Wait for health check
+          sleep 30
+          
+          # Verify deployment
+          if [ "$(docker inspect -f '{{.State.Health.Status}}' ${CONTAINER_NAME})" = "healthy" ]; then
+            echo "Deployment successful!"
+            docker ps --filter name="${CONTAINER_NAME}"
+          else
+            echo "Health check failed"
+            docker logs "${CONTAINER_NAME}"
+            exit 1
+          fi
+    
+    - name: Verify deployment
+      uses: appleboy/ssh-action@v0.1.5
+      with:
+        host: ${{ secrets.DROPLET_HOST }}
+        username: ${{ secrets.DROPLET_USER }}
+        key: ${{ secrets.DROPLET_SSH_KEY }}
+        port: ${{ secrets.SSH_PORT }}
+        script: |
+          curl -f http://localhost/health || exit 1
+          echo "Application is healthy and running!"
