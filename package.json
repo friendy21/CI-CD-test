@@ -1,0 +1,32 @@
+{
+  "name": "cicd-nomad-app",
+  "version": "1.0.0",
+  "description": "Simple Node.js app for CI/CD testing with Nomad",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "echo \"No tests specified\" && exit 0",
+    "lint": "echo \"No linting configured\" && exit 0"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  },
+  "keywords": [
+    "nodejs",
+    "express",
+    "docker",
+    "cicd",
+    "nomad"
+  ],
+  "author": "CI/CD Test",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/friendy21/CI-CD-test.git"
+  }
+}
