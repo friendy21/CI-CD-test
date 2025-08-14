@@ -1,0 +1,27 @@
+# .dockerignore
+node_modules
+npm-debug.log
+.git
+.gitignore
+.github
+.env*
+.vscode
+.idea
+*.md
+.dockerignore
+Dockerfile*
+docker-compose*.yml
+.DS_Store
+coverage
+.nyc_output
+logs
+*.log
+test
+tests
+.eslintrc*
+.prettierrc*
+etc/
+scripts/
+*.nomad
+setup-*.sh
+deploy-*.sh
