@@ -16,8 +16,12 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production --ignore-scripts && \
+# Install dependencies - use npm install if no package-lock.json exists
+RUN if [ -f package-lock.json ]; then \
+        npm ci --only=production --ignore-scripts; \
+    else \
+        npm install --only=production --ignore-scripts; \
+    fi && \
     npm cache clean --force
 
 # Copy application code
