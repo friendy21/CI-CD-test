@@ -1,0 +1,62 @@
+# .gitignore
+
+# Dependencies
+node_modules/
+bower_components/
+
+# Production
+/build
+/dist
+
+# Environment files - NEVER commit these!
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+coverage/
+.nyc_output/
+
+# Docker
+docker-compose.override.yml
+
+# Secrets - CRITICAL: Never commit these!
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.ssh/
+secrets/
+credentials/
+
+# Backup files
+*.backup
+*.bak
+*.tmp
+
+# Local configuration
+config/local.json
+config/local.js
+
+# Generated files
+package-lock.json.*
