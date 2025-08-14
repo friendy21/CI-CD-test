@@ -1,49 +1,164 @@
-# Simplified Multi-stage Dockerfile for Testing
-FROM node:18-alpine AS base
+#!/bin/bash
+# setup.sh - Simple GitHub Secrets Setup
+set -e
 
-# Install security updates and required tools
-RUN apk update && \
-    apk upgrade && \
-    apk add --no-cache curl ca-certificates dumb-init && \
-    rm -rf /var/cache/apk/*
+echo "================================================"
+echo "     GitHub Secrets Setup for CI/CD Pipeline"
+echo "================================================"
+echo ""
 
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001 -G nodejs
+# Check if gh CLI is installed
+if ! command -v gh &> /dev/null; then
+    echo "❌ GitHub CLI (gh) is not installed!"
+    echo ""
+    echo "Please install it first:"
+    echo "  macOS:  brew install gh"
+    echo "  Ubuntu: sudo apt install gh"
+    echo "  Other:  https://cli.github.com/manual/installation"
+    exit 1
+fi
 
-WORKDIR /app
+# Check GitHub authentication
+echo "📝 Checking GitHub authentication..."
+if ! gh auth status &>/dev/null; then
+    echo "Please authenticate with GitHub:"
+    gh auth login
+fi
 
-# Copy package files
-COPY package*.json ./
+echo "✅ GitHub CLI authenticated"
+echo ""
 
-# Install dependencies - use npm install if no package-lock.json exists
-RUN if [ -f package-lock.json ]; then \
-        npm ci --only=production --ignore-scripts; \
-    else \
-        npm install --only=production --ignore-scripts; \
-    fi && \
-    npm cache clean --force
+# Get repository name
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "")
+if [ -z "$REPO" ]; then
+    echo "Enter your GitHub repository (e.g., friendy21/CI-CD-test):"
+    read -r REPO
+fi
 
-# Copy application code
-COPY . .
+echo "📦 Repository: $REPO"
+echo ""
 
-# Set ownership
-RUN chown -R nodejs:nodejs /app
+# Function to set secret
+set_secret() {
+    local name=$1
+    local value=$2
+    echo -n "  Setting $name... "
+    if echo "$value" | gh secret set "$name" --repo="$REPO" 2>/dev/null; then
+        echo "✅"
+    else
+        echo "❌ Failed"
+        return 1
+    fi
+}
 
-# Switch to non-root user
-USER nodejs
+echo "================================================"
+echo "         Docker Hub Configuration"
+echo "================================================"
+echo ""
 
-# Environment variables
-ENV NODE_ENV=production \
-    PORT=3000
+# Docker Hub credentials
+echo "Enter your Docker Hub username:"
+read -r DOCKER_USERNAME
 
-# Expose port
-EXPOSE 3000
+echo "Enter your Docker Hub Access Token (hidden):"
+echo "  (Create one at: https://hub.docker.com/settings/security)"
+read -rs DOCKER_TOKEN
+echo ""
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD curl -f http://localhost:3000/health || exit 1
+# Server configuration
+echo ""
+echo "================================================"
+echo "         Server Configuration"
+echo "================================================"
+echo ""
 
-# Use dumb-init and start application
-ENTRYPOINT ["dumb-init", "--"]
-CMD ["node", "server.js"]
+echo "Enter your server IP address:"
+read -r DROPLET_HOST
+
+echo "Enter SSH username (default: root):"
+read -r DROPLET_USER
+DROPLET_USER="${DROPLET_USER:-root}"
+
+echo "Enter SSH port (default: 22):"
+read -r SSH_PORT
+SSH_PORT="${SSH_PORT:-22}"
+
+# SSH Key generation
+echo ""
+echo "================================================"
+echo "         SSH Key Configuration"
+echo "================================================"
+echo ""
+
+SSH_KEY_PATH="$HOME/.ssh/cicd_deploy_$(date +%s)"
+
+echo "Generating SSH key pair..."
+ssh-keygen -t ed25519 -f "$SSH_KEY_PATH" -N "" -C "github-actions-deploy" -q
+
+echo ""
+echo "📋 PUBLIC KEY - Add this to your server's ~/.ssh/authorized_keys:"
+echo "================================================"
+cat "${SSH_KEY_PATH}.pub"
+echo "================================================"
+echo ""
+
+echo "To add the key to your server, run this command on your LOCAL machine:"
+echo ""
+echo "  ssh-copy-id -i ${SSH_KEY_PATH}.pub -p $SSH_PORT $DROPLET_USER@$DROPLET_HOST"
+echo ""
+echo "Or manually add the above public key to the server."
+echo ""
+
+read -p "Press Enter after you've added the public key to your server..."
+
+# Test SSH connection
+echo ""
+echo "Testing SSH connection..."
+if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -i "$SSH_KEY_PATH" -p "$SSH_PORT" "$DROPLET_USER@$DROPLET_HOST" "echo 'SSH connection successful!'" 2>/dev/null; then
+    echo "✅ SSH connection successful!"
+else
+    echo "⚠️  SSH connection failed. Please ensure the public key is added correctly."
+    echo "    Continuing anyway..."
+fi
+
+# Read private key
+DROPLET_SSH_KEY=$(<"$SSH_KEY_PATH")
+
+# Set all secrets
+echo ""
+echo "================================================"
+echo "         Setting GitHub Secrets"
+echo "================================================"
+echo ""
+
+set_secret "DOCKER_USERNAME" "$DOCKER_USERNAME"
+set_secret "DOCKER_TOKEN" "$DOCKER_TOKEN"
+set_secret "DROPLET_HOST" "$DROPLET_HOST"
+set_secret "DROPLET_USER" "$DROPLET_USER"
+set_secret "DROPLET_SSH_KEY" "$DROPLET_SSH_KEY"
+set_secret "SSH_PORT" "$SSH_PORT"
+
+echo ""
+echo "================================================"
+echo "              Setup Complete!"
+echo "================================================"
+echo ""
+echo "✅ All secrets have been configured!"
+echo ""
+echo "📝 Your SSH keys are saved at:"
+echo "   Private: $SSH_KEY_PATH"
+echo "   Public:  ${SSH_KEY_PATH}.pub"
+echo ""
+echo "🚀 Next steps:"
+echo "   1. Delete the old workflow: rm .github/workflows/nomad-deploy.yml"
+echo "   2. Commit and push your changes"
+echo "   3. The CI/CD pipeline will run automatically"
+echo ""
+echo "🔒 Security reminders:"
+echo "   - Keep your SSH private key secure"
+echo "   - Never commit secrets to your repository"
+echo "   - Rotate tokens regularly"
+echo ""
+echo "📦 To trigger deployment manually:"
+echo "   git push origin main"
+echo ""
