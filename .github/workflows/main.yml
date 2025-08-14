@@ -1,4 +1,4 @@
-# .github/workflows/main.yml - Fixed and Simplified
+# .github/workflows/main.yml - SECURE VERSION
 name: Secure CI/CD Pipeline
 
 on:
@@ -9,20 +9,14 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: friendy21/cicd-nomad-app
-  # Hardcoded for testing - NEVER do this in production
-  DOCKER_USERNAME: friendy21
-  DOCKER_TOKEN: dckr_pat_TrLIn2QLrbBwY77IsPlkudXFK6U
-  DROPLET_HOST: 137.184.85.0
-  DROPLET_USER: root
-  SSH_PORT: 22
+  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/cicd-nomad-app
 
 jobs:
   security-scan:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write  # Required for SARIF uploads
+      security-events: write
     
     steps:
     - name: Checkout code
@@ -36,10 +30,10 @@ jobs:
         format: 'sarif'
         output: 'trivy-results.sarif'
         severity: 'CRITICAL,HIGH,MEDIUM'
-        exit-code: '0'  # Don't fail build on vulnerabilities for testing
+        exit-code: '1'  # Fail on critical vulnerabilities
     
     - name: Upload Trivy results to GitHub Security
-      uses: github/codeql-action/upload-sarif@v3  # Updated to v3
+      uses: github/codeql-action/upload-sarif@v3
       if: always()
       with:
         sarif_file: 'trivy-results.sarif'
@@ -52,7 +46,7 @@ jobs:
       packages: write
       security-events: write
       id-token: write
-      actions: read  # Additional permission
+      actions: read
     
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
@@ -71,8 +65,8 @@ jobs:
     - name: Log in to Docker Hub
       uses: docker/login-action@v3
       with:
-        username: ${{ env.DOCKER_USERNAME }}
-        password: ${{ env.DOCKER_TOKEN }}
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_TOKEN }}
     
     - name: Extract metadata
       id: meta
@@ -94,11 +88,18 @@ jobs:
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha  # Use GitHub Actions cache
+        cache-from: type=gha
         cache-to: type=gha,mode=max
         build-args: |
           VERSION=${{ github.sha }}
           BUILD_DATE=${{ github.event.head_commit.timestamp }}
+    
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        format: spdx-json
+        output-file: sbom.spdx.json
     
     - name: Scan pushed Docker image
       uses: aquasecurity/trivy-action@master
@@ -110,7 +111,7 @@ jobs:
         exit-code: '0'
     
     - name: Upload Docker scan results
-      uses: github/codeql-action/upload-sarif@v3  # Updated to v3
+      uses: github/codeql-action/upload-sarif@v3
       if: always()
       with:
         sarif_file: 'docker-scan.sarif'
@@ -122,87 +123,48 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     environment:
       name: production
-      url: http://${{ env.DROPLET_HOST }}
+      url: http://${{ secrets.DROPLET_HOST }}
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Create SSH private key file
+    - name: Setup SSH
       run: |
-        cat > ssh_private_key <<'EOF'
-        -----BEGIN OPENSSH PRIVATE KEY-----
-        # REPLACE THIS WITH YOUR ACTUAL SSH PRIVATE KEY
-        # This is a placeholder - you need to replace this with your real key
-        YOUR_ACTUAL_SSH_PRIVATE_KEY_CONTENT_HERE
-        -----END OPENSSH PRIVATE KEY-----
-        EOF
-        chmod 600 ssh_private_key
+        mkdir -p ~/.ssh
+        echo "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H -p ${{ secrets.SSH_PORT }} ${{ secrets.DROPLET_HOST }} >> ~/.ssh/known_hosts
     
     - name: Deploy to DigitalOcean
+      env:
+        IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}
+        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        DOCKER_TOKEN: ${{ secrets.DOCKER_TOKEN }}
       run: |
-        set -euo pipefail
-        
-        # Deploy using SSH
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ssh_private_key -p ${{ env.SSH_PORT }} ${{ env.DROPLET_USER }}@${{ env.DROPLET_HOST }} << 'ENDSSH'
-        set -euo pipefail
-        
-        # Configuration
-        IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}"
-        CONTAINER_NAME="app-container"
-        
-        echo "Deploying image: ${IMAGE}"
-        
-        # Login to Docker Hub
-        echo "${{ env.DOCKER_TOKEN }}" | docker login -u "${{ env.DOCKER_USERNAME }}" --password-stdin
-        
-        # Pull new image
-        docker pull "${IMAGE}"
-        
-        # Stop and remove old container if exists
-        docker stop "${CONTAINER_NAME}" 2>/dev/null || true
-        docker rm "${CONTAINER_NAME}" 2>/dev/null || true
-        
-        # Start new container
-        docker run -d \
-          --name "${CONTAINER_NAME}" \
-          --restart unless-stopped \
-          --memory="512m" \
-          --cpus="0.5" \
-          --health-cmd="curl -f http://localhost:3000/health || exit 1" \
-          --health-interval=30s \
-          --health-timeout=10s \
-          --health-retries=3 \
-          --health-start-period=30s \
-          -p 80:3000 \
-          -e NODE_ENV=production \
-          -e PORT=3000 \
-          "${IMAGE}"
-        
-        echo "Deployment completed successfully!"
-        docker ps --filter name="${CONTAINER_NAME}"
-        
-        # Cleanup old images
-        docker image prune -af --filter "until=24h" || true
-        ENDSSH
+        ssh -i ~/.ssh/deploy_key \
+            -p ${{ secrets.SSH_PORT }} \
+            ${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_HOST }} \
+            'bash -s' < ./scripts/deploy-production.sh \
+            "$IMAGE" \
+            "$DOCKER_USERNAME" \
+            "$DOCKER_TOKEN"
     
     - name: Verify deployment
       run: |
         sleep 10
-        if curl -f --max-time 30 http://${{ env.DROPLET_HOST }}/health; then
-          echo "✅ Application is healthy and running!"
-          echo "🌐 Application URL: http://${{ env.DROPLET_HOST }}" 
+        response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 http://${{ secrets.DROPLET_HOST }}/health)
+        if [ "$response" = "200" ]; then
+          echo "✅ Deployment successful - Health check passed"
+          echo "### Deployment Successful ✅" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: [http://${{ secrets.DROPLET_HOST }}](http://${{ secrets.DROPLET_HOST }})" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: \`${{ needs.build-and-push.outputs.image-digest }}\`" >> $GITHUB_STEP_SUMMARY
         else
-          echo "❌ Application health check failed"
+          echo "❌ Health check failed with status: $response"
           exit 1
         fi
     
-    - name: Deployment summary
+    - name: Cleanup SSH
       if: always()
       run: |
-        echo "### Deployment Summary 📊" >> $GITHUB_STEP_SUMMARY
-        echo "- **Status**: ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Image**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Digest**: \`${{ needs.build-and-push.outputs.image-digest }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **URL**: [http://${{ env.DROPLET_HOST }}](http://${{ env.DROPLET_HOST }})" >> $GITHUB_STEP_SUMMARY
-        echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        rm -f ~/.ssh/deploy_key
